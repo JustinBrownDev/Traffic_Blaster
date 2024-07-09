@@ -1,27 +1,25 @@
 # Justin Brown - 7/8/2024 - Traffic Blaster
-import shlex
-import asyncio
-import os
-import sys
-import time
-import random
-import psutil
-import requests
-import subprocess
-from requests_toolbelt.adapters import source
-from datetime import datetime, timedelta
+import grequests # async reqs
+#Basic Imports
+import os  # list dir, path exists, etc.
+import random  # for testing
+from datetime import datetime, timedelta  # for action delays
 # noinspection PyUnresolvedReferences
-import traceback
-from threading import Thread
-from queue import Queue, Empty
+import traceback  # for debugging
+import requests
 
-ON_POSIX = 'posix' in sys.builtin_module_names
+import subprocess  # subprocess to run openvpn instance
 
+from threading import Thread  # threads for non-blocking read from openvpn process's output
+from queue import Queue, Empty  # queue for the same as above
 
-def enqueue_output(out, queue):
+import sys  # only needed for the next command
+ON_POSIX = 'posix' in sys.builtin_module_names  # for openvpn proc, tbh I have no idea what this does...
+# getting the output buffers without hanging everything was challenging
+def add_output_to_queue(out, queue):
+    # Callba
     for line in iter(out.readline, b''):
         queue.put(line)
-    #out.close()
 
 
 class enum:
@@ -50,12 +48,11 @@ class tb_session_state(enum):
 
 
 
-
 session_state = tb_session_state()
 
 
 class im_waiting:
-    def __init__(self, delay_dictionary = None):
+    def __init__(self, delay_dictionary=None):
         self.waiting = False
         self.timer_started = datetime.now()
         self.timer_length = timedelta(seconds=0)
@@ -69,14 +66,17 @@ class im_waiting:
         if self.waiting and datetime.now() - self.timer_started >= self.timer_length:
             self.waiting = False
         return not self.waiting
-    def delay_seconds(self,seconds):
+
+    def delay_seconds(self, seconds):
         self.waiting = True
         self.timer_started = datetime.now()
         self.timer_length = timedelta(seconds=seconds)
+
     def delay_from_dic(self, state):
         self.waiting = True
         self.timer_started = datetime.now()
         self.timer_length = timedelta(seconds=self.delay_dictionary[state])
+
 
 
 class tb_session:
@@ -117,6 +117,8 @@ class tb_session:
         self.last_print_time = datetime.now()
         self.delay_start = datetime.now() - timedelta(seconds=7)
         self.last_state = self.state
+        self.request_list = []
+        self.response_list = []
 
     # User Code
     def open(self):  #open a process
@@ -140,7 +142,7 @@ class tb_session:
         )
         self.q = Queue()
         self.stdout = self.ovpn_client_process.stdout
-        t = Thread(target=enqueue_output, args=(self.ovpn_client_process.stdout, self.q))
+        t = Thread(target=add_output_to_queue, args=(self.ovpn_client_process.stdout, self.q))
         t.daemon = True
         t.start()
         self.time_initialized = datetime.now()
@@ -148,7 +150,7 @@ class tb_session:
 
     def check_initialization_process(self):
         print_strings = [f"[{self.name}]", f"({session_state.name(self.state)})",
-                f"remote: {self.remote_ip}", f"{self.geolocation}", f"local: {self.local_ip}"""]
+                         f"remote: {self.remote_ip}", f"{self.geolocation}", f"local: {self.local_ip}"""]
         print_str = "".join(print_strings)
         if self.last_print != print_str or datetime.now() - self.last_print_time > timedelta(seconds=5):
             p.print("check_initialization_process", print_strings)
@@ -179,74 +181,84 @@ class tb_session:
                 self.check_connection()
         return self.state
 
-    def get(self, url, timeout=None):
+    def getreq(self, url, timeout=None):
         if timeout is None:
             timeout = self.request_timeout
         return self.requests_session.get(url, timeout=timeout)
+    def send_reqs(self,urls):
+        self.request_list.clear()
+        self.request_list.extend([grequests.get(url, session=self.requests_session) for url in urls])
+        self.response_list.clear()
+        self.response_list.extend(grequests.map(self.request_list, size=0))
+
 
     # Check Session
     def check_connection(self):
-        if self.state != session_state.ONLINE or datetime.now() - self.time_of_last_connection_check > timedelta(seconds=15):
+        if self.state == session_state.TESTING_CONNECTION or datetime.now() - self.time_of_last_connection_check > timedelta(
+                seconds=15):
             self.time_of_last_connection_check = datetime.now()
-            if self.remote_ip:
+            if self.state == session_state.TESTING_CONNECTION:
                 ip = self.request_ip_api()
-                geolocation = self.request_geo_api(self.remote_ip)
-                if ip is None or geolocation is None:
-                    self.state = session_state.CONNECTION_DOWN
-                elif not self.remote_ip == ip or not self.geolocation == geolocation:
-                    self.state = session_state.TRAFFIC_MISMATCH
-            else:
-                ip = self.request_ip_api()
-                geolocation = self.request_geo_api(ip)
+                if ip:
+                    geolocation = self.request_geo_api(ip)
                 if ip is None or geolocation is None:
                     self.state = session_state.CONNECTION_ERROR
                 else:
                     self.remote_ip = ip
                     self.geolocation = geolocation
                     self.state = session_state.CONNECTION_TESTED
+            else:
+                ip = self.request_ip_api()
+                geolocation = self.request_geo_api(self.remote_ip)
+                if ip is None or geolocation is None:
+                    self.state = session_state.CONNECTION_DOWN
+                elif not self.remote_ip == ip or not self.geolocation == geolocation:
+                    self.state = session_state.TRAFFIC_MISMATCH
 
     def request_ip_api(self):
         try:
-            sesresponse_ip = self.get('http://emapp.cc/get_my_ip', timeout=self.internal_request_timeout)
-            if sesresponse_ip.status_code != 200:
-                success = False
-                print(f"ip api: {sesresponse_ip.status_code}")
-            ip = sesresponse_ip.text
-            ses_dic_ip = eval(ip)
-            ip = ses_dic_ip["result_data"]
-            return ip
+            sesresponse_ip = self.getreq('http://emapp.cc/get_my_ip', timeout=self.internal_request_timeout)
         except Exception:
             self.log.write("check_connection",
                            f"\n\n  -{datetime.now().strftime('%H:%M | %S')}-\n{traceback.format_exc()}")
             print(f"failed to connect to session IP api : {self.remote_ip}")
 
             return None
-
-    def set_remote_ip(self, ip):
-        self.remote_ip = ip
-
-    def set_geolocation(self, geo):
-        self.geolocation = geo
+        if sesresponse_ip.status_code != 200:
+            success = False
+            print(f"ip api: {sesresponse_ip.status_code}")
+        ip = sesresponse_ip.text
+        ses_dic_ip = eval(ip)
+        if not type(ses_dic_ip) == dict or "result_data" not in ses_dic_ip:
+            ip = ses_dic_ip["result_data"]
+            return ip
+        else:
+            self.log.write("check_connection",
+                           f"\n\n  -{datetime.now().strftime('%H:%M | %S')}-\n{ip}")
+            print(f"failed to connect to session IP api : {self.remote_ip}")
+            return None
 
     def request_geo_api(self, ip=None):
         if ip is None:
             ip = self.remote_ip
         try:
-            sesresponse_geo = self.get(f"http://ip-api.com/json/{ip}",
+            sesresponse_geo = self.getreq(f"http://ip-api.com/json/{ip}",
                                        timeout=self.internal_request_timeout)
-            if sesresponse_geo.status_code != 200:
-                success = False
-                print(f"geo api: {sesresponse_geo.status_code}")
-            item_geo = sesresponse_geo.text
-            if item_geo:
-                ses_dic_geo = eval(item_geo)
-                item_geo = ses_dic_geo["city"] + ", " + ses_dic_geo["country"]
-                return item_geo
         except Exception:
             self.log.write("check_connection",
                            f"\n\n  -{datetime.now().strftime('%H:%M | %S')}-\n{traceback.format_exc()}")
             print(f"failed to connect to session geolocation api {self.geolocation}")
             return None
+        if sesresponse_geo.status_code != 200:
+            success = False
+            print(f"geo api: {sesresponse_geo.status_code}")
+        item_geo = sesresponse_geo.text
+        if item_geo:
+            ses_dic_geo = eval(item_geo)
+            item_geo = ses_dic_geo["city"] + ", " + ses_dic_geo["country"]
+            return item_geo
+
+
 
     # Networking
     def mount_session(self):
@@ -303,7 +315,6 @@ class tb_session:
                     break
             self.local_ip = line[96:i]
 
-
     def recycle(self):
         pass
 
@@ -311,20 +322,6 @@ class tb_session:
         if self.requests_session:
             self.requests_session.close()
         self.ovpn_client_process.terminate()
-
-
-def get_interfaces():  # get interfaces that look like vpn tunnels
-    addresses = psutil.net_if_addrs()
-    stats = psutil.net_if_stats()
-    iface_addrs = []
-    for intface, addr_list in addresses.items():
-        if any(getattr(addr, 'address').startswith("169.254") for addr in addr_list):
-            continue
-        elif intface in stats and getattr(stats[intface], "isup"):
-            for addr in addr_list:
-                if str(addr.address).startswith("10.9"):
-                    iface_addrs.append(addr.address)
-    return iface_addrs
 
 
 class TrafficBlaster:
@@ -371,6 +368,7 @@ class TrafficBlaster:
         self.PROC_CREATE_INTERVAL = timedelta(seconds=args.get("PROC_CREATE_INTERVAL", 60))
         self.time_since_last_proc = datetime.now() - self.PROC_CREATE_INTERVAL
         self.fully_initialized = False
+
     def get_next_conf(self):  # something better later
         conf = self.dir_list.pop()
         while conf[:2] != "us":
@@ -387,8 +385,7 @@ class TrafficBlaster:
             elif not c.isnumeric() and got_to_numeric:
                 break
 
-
-        return string[:idx-1]
+        return string[:idx - 1]
 
     def maintain_sessions(self):
         all_set = False
@@ -418,6 +415,12 @@ class TrafficBlaster:
                     all_set = False
                     self.time_since_last_proc = self.time_since_last_proc - self.PROC_CREATE_INTERVAL
         self.fully_initialized = True
+    def send_reqs(self,urls):
+        for sess in self.sessions:
+            self.sessions[sess].send_reqs(urls)
+        for sess in self.sessions:
+            print(self.sessions[sess].response_list)
+            print()
     def recycle_session(self, sess):
         self.kill_session(sess)
         return self.make_new_session()
@@ -504,14 +507,17 @@ def timer(target, args):
 
 
 if __name__ == "__main__":
+    test_urls = [
+        'http://bbc.co.uk', 'http://www.msc.com', 'http://www.cia.gov', 'http://www.whitehouse.gov'
+    ]
     tb = TrafficBlaster(OPENVPN_EXE_FULL_PATH="C:\\Program Files\\OpenVPN\\bin\\openvpn.exe",
                         OPENVPN_CONFIG_FOLDER_PATH="C:\\Users\\justi\\PycharmProjects\\Traffic_Blaster\\ovpn configs",
                         OPENVPN_CREDENTIALS_PATH="C:\\Users\\justi\\Documents\\ovpncreds.txt",
-                        NUM_CONCURRENT_VPN_PROCS=10,
+                        NUM_CONCURRENT_VPN_PROCS=3,
                         OVPN_CONNECT_TIMEOUT=30,
                         PROC_CREATE_INTERVAL=15
                         )
     while True:
         tb.maintain_sessions()
         print("Yay!")
-
+        tb.send_reqs(test_urls)
