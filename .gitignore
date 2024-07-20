@@ -1,3 +1,2 @@
-/logs/ovpn/
-/logs/get_session_info/
-/ovpn configs/
+/testing/ovpn configs/*
+/testing/logs/*/
